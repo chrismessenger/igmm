@@ -145,8 +145,8 @@ def plotResult(Samp,Y,Nburn,Nstep,mu,s,pi,outfile,N=250):
                 if (aa > Nburn) and ((aa - Nburn) % Nstep == 0):
                     temp.append(0)
                     for newpi,newmu,news in zip(S.pi,S.mu,S.s):
-                        for newnewpi,newnewmu in zip(newpi,newmu):
-                            temp[bb] += newnewpi*norm.pdf(yy,loc=newnewmu,scale=1.0/np.sqrt(news))
+                        for newnewpi,newnewmu,newnews in zip(newpi,newmu,news):
+                            temp[bb] += newnewpi*norm.pdf(yy,loc=newnewmu,scale=1.0/np.sqrt(newnews))
                     bb += 1
             temp = np.reshape(np.squeeze(temp),(1,-1))
             fun[0,idx] = np.percentile(temp,50)
@@ -282,14 +282,15 @@ def main():
         temp = [np.sum((Y[np.argwhere(c==j)]-mu[j])**2) for j in xrange(k)]
         s = drawGammaRas(beta + n,(beta + n)/(w*beta + temp),size=k)
 
+        # compute the unrepresented probability 
+        p_unrep = [alpha/(N-1.0+alpha)*IntegralApprox(Yi,lam,r,beta,w,size=args.Nint) for Yi in Y]
+        p_temp = np.outer(np.ones(k+1),p_unrep)
+        
         # for the represented components
-        p_temp = np.zeros((k+1,N))
         for j in xrange(k):
             nij = n[j] - (c==j).astype(int)
-            p_temp[j,:] = nij/(N-1.0+alpha)*np.sqrt(s[j])*np.exp(-0.5*s[j]*(Y-mu[j])**2)
-
-        # for the unrepresented components
-        p_temp[k,:] = [alpha/(N-1.0+alpha)*IntegralApprox(Yi,lam,r,beta,w,size=args.Nint) for Yi in Y]
+            idx = nij>0         # only apply to indices where we have multi occupancy
+            p_temp[j,idx] = nij[idx]/(N-1.0+alpha)*np.sqrt(s[j])*np.exp(-0.5*s[j]*(Y[idx]-mu[j])**2)
 
         # stochastic indicator (we could have a new component)
         jvec = np.arange(k+1)
@@ -302,7 +303,7 @@ def main():
         beta = drawBeta(k,s,w)
         
         # sort out based on new stochastic indicators
-        nij = np.sum(c==k)        # see if the new components have occupancy
+        nij = np.sum(c==k)        # see if the *new* component has occupancy
         if nij>0:
             # draw from priors and increment k
             newmu = drawNormal(mean=lam,var=1.0/r)
@@ -311,22 +312,21 @@ def main():
             s = np.concatenate((s,news)) 
             k = k + 1
     
+        # find unrepresented components
+        n = np.array([np.sum(c==j) for j in xrange(k)])
+        badidx = np.argwhere(n==0)
+        Nbad = len(badidx)
+
         # remove unrepresented components
-        badidx = np.zeros(k)
-        cnt = 0
-        for j in xrange(k):
-            nij = np.sum(c==j)
-            if nij==0:
-                badidx[cnt] = j
-                cnt += 1
-        if cnt>0:
-            mu = np.delete(mu,badidx[:cnt])
-            s = np.delete(s,badidx[:cnt])
-            idx = np.argwhere(c>np.min(badidx[:cnt]))
-            c[idx] = c[idx]-cnt
-            k -= cnt        # update component number
-        
-        # compute n
+        if Nbad>0:
+            mu = np.delete(mu,badidx)
+            s = np.delete(s,badidx)
+            for cnt,i in enumerate(badidx):
+                idx = np.argwhere(c>=(i-cnt))
+                c[idx] = c[idx]-1
+            k -= Nbad        # update component number
+
+        # recompute n
         n = np.array([np.sum(c==j) for j in xrange(k)])
 
         # from pi
@@ -359,6 +359,7 @@ def main():
     # plot the represented components
     plt.figure()
     kvec = [samples.k for samples in Samp]
+    kvec = kvec[int(0.75*args.Nsamples)::5]     # take only the last 25% and every 5th
     kmax = 3 + np.max(kvec)
     plt.hist(kvec,bins=np.arange(kmax),histtype='stepfilled',align='left',color='b',normed=True)
     plt.xlim([0,kmax-1])
