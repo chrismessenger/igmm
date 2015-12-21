@@ -205,7 +205,7 @@ def parser():
     parser.add_argument('-m', '--mu', type=float, nargs='+', default=[-3,1,15], help='the means of the simulated Gaussians')
     parser.add_argument('-p', '--pi', type=float, nargs='+', default=[0.5,0.25,0.25], help='the simulated Gaussian weights')
     parser.add_argument('-N', '--Ndata', type=int, default=100, help='the number of input data samples to use')
-    parser.add_argument('-n', '--Nsamples', type=int, default=100, help='the number of samples to produce')
+    parser.add_argument('-n', '--Nsamples', type=int, default=1000, help='the number of samples to produce')
     parser.add_argument('-a', '--Nint', type=int, default=100, help='the number of samples used in approximating the tricky integral')
     parser.add_argument('-z', '--seed', type=int, default=1, help='the random seed')
     parser.add_argument('-v', '--verb', action='count', default=0)
@@ -343,10 +343,10 @@ def main():
     print "time to complete = %.3f sec" % (time.time()-t)    
 
     # make corner plot for prior params (lambda,r,beta,w,alpha,k)
-    x = [[sample.lam,sample.r,np.log(sample.beta),sample.w,sample.alpha] for sample in Samp] 
+    x =[[sample.lam,sample.r,np.log(sample.beta),np.log(sample.w),np.log(sample.alpha)] for sample in Samp] 
     x = np.transpose(np.hstack(x))
     figure = corner.corner(x, labels=[r"$\lambda$", r"$r$", r"$\log \beta$",
-                                     r"$w$", r"$\alpha$"],
+                                     r"$\log w$", r"$\log \alpha$"],
                          quantiles=[0.16, 0.5, 0.84],
                          show_titles=True, title_args={"fontsize": 16})
     figure.savefig("./priorparams.png")
@@ -359,7 +359,7 @@ def main():
     # plot the represented components
     plt.figure()
     kvec = [samples.k for samples in Samp]
-    kvec = kvec[int(0.75*args.Nsamples)::5]     # take only the last 25% and every 5th
+    kvec = kvec[int(0.75*args.Nsamples)::25]     # take only the last 25% and every 25th
     kmax = 3 + np.max(kvec)
     plt.hist(kvec,bins=np.arange(kmax),histtype='stepfilled',align='left',color='b',normed=True)
     plt.xlim([0,kmax-1])
@@ -368,7 +368,7 @@ def main():
     plt.savefig('./components.png')
 
     # plot the distribution
-    plotResult(Samp,Y,int(0.75*args.Nsamples),5,args.mu,args.prec,args.pi,'./distributions.png')
+    plotResult(Samp,Y,int(0.75*args.Nsamples),min(25,int(args.Nsamples/20)),args.mu,args.prec,args.pi,'./distributions.png')
     print 'success.'    
 
 if __name__ == "__main__":
