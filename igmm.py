@@ -289,7 +289,7 @@ def main():
         # for the represented components
         for j in xrange(k):
             nij = n[j] - (c==j).astype(int)
-            idx = nij>0         # only apply to indices where we have multi occupancy
+            idx = np.argwhere(nij>0)         # only apply to indices where we have multi occupancy
             p_temp[j,idx] = nij[idx]/(N-1.0+alpha)*np.sqrt(s[j])*np.exp(-0.5*s[j]*(Y[idx]-mu[j])**2)
 
         # stochastic indicator (we could have a new component)
