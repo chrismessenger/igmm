@@ -1,5 +1,24 @@
+#########################################################################
+#    igmm.py - An implementation of an infinite Gaussian mixture model
+#    Copyright (C) 2016  C.Messenger
+#
+#    This program is free software: you can redistribute it and/or modify
+#    it under the terms of the GNU General Public License as published by
+#    the Free Software Foundation, either version 3 of the License, or
+#    (at your option) any later version.
+#
+#    This program is distributed in the hope that it will be useful,
+#    but WITHOUT ANY WARRANTY; without even the implied warranty of
+#    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+#    GNU General Public License for more details.
+#
+#    You should have received a copy of the GNU General Public License
+#    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+##########################################################################
+
 import numpy as np
 import matplotlib.pyplot as plt
+import matplotlib.gridspec as gridspec
 from matplotlib.patches import Ellipse
 from scipy.stats import norm, uniform, gamma, chi2 # wishart
 from scipy.stats import multivariate_normal as mv_norm
@@ -10,7 +29,7 @@ import time
 import copy
 import time
 import corner
-import sys 
+import sys
 from ARS import ARS
 
 # the maximum positive integer for use in setting the ARS seed
@@ -31,9 +50,10 @@ class Sample:
 
 class Samples:
     """Class for generating a collection of samples"""
-    def __init__(self,N):
+    def __init__(self,N,nd):
         self.sample = []
         self.N = N
+        self.nd = nd
 
     def __getitem__(self, key): 
         return self.sample[key]
@@ -41,7 +61,279 @@ class Samples:
     def addsample(self,S):
         return self.sample.append(S)
 
-def IntegralApprox(y,lam,r,beta,w,size=100):
+# the sampler
+def igmm_sampler(Y,Nsamples,missmat=None,Nint=1,anneal=False,verb=False):
+    """Takes command line args and computes samples from the joint posterior
+    using Gibbs sampling
+
+    input:
+        Y - the input dataset
+        Nsamples - the number of Gibbs samples
+        missmat - the matrix indicating missing data
+        Nint - the samples used for evaluating the tricky integral
+        anneal - perform simple siumulated annealing
+        verb - show verbose output
+
+    output:
+        Samp - the output samples
+
+    """
+
+    # first rescale the data to be more manageable
+    Y,scale = scaledata(Y,missmat)
+
+    # compute some data derived quantities
+    N,nd = Y.shape
+    muy = np.zeros(nd)
+    covy = np.zeros((nd,nd))
+    for i in xrange(nd):
+        idx_i = np.argwhere(np.squeeze(missmat[:,i])==0)
+        muy[i] = np.mean(Y[idx_i,i])
+        covy[i,i] = np.var(Y[idx_i,i])
+    inv_covy = inv(covy) if nd>1 else np.reshape(1.0/covy,(1,1))
+    if verb:
+        print '{}: mean(Y) = {}'.format(time.asctime(),np.reshape(muy,(1,-1)))
+        print '{}: cov(Y) = {}'.format(time.asctime(),np.reshape(covy,(1,-1)))
+        print '{}: min(Y) = {}'.format(time.asctime(),np.min(Y,0))
+        print '{}: max(Y) = {}'.format(time.asctime(),np.max(Y,0))
+
+    # compute indices of data with any missing elements
+    missidx = []
+    for i,m in enumerate(missmat):
+        idx = np.argwhere(m==1)
+        if idx.size:
+            missidx.append(i)
+            for j in idx:
+                Y[i,j] = 0.0
+
+    # initialise a single sample
+    Samp = Samples(Nsamples,nd)
+
+    c = np.zeros(N)            # initialise the stochastic indicators
+    pi = np.zeros(1)           # initialise the weights
+    mu = np.zeros((1,nd))      # initialise the means
+    s = np.zeros((1,nd*nd))    # initialise the precisions
+    n = np.zeros(1)            # initialise the occupation numbers
+
+    mu[0,:] = muy              # set first mu to the mean of all data
+    pi[0] = 1.0                # only one component so pi=1
+    temp = drawGamma(0.5,2.0/float(nd))
+    beta = np.squeeze(float(nd) - 1.0 + 1.0/temp)     # draw beta from prior
+    w = drawWishart(nd,covy/float(nd))                # draw w from prior
+  
+    # draw s from prior
+    s[0,:] = np.squeeze(np.reshape(drawWishart(float(beta),inv(beta*w)),(nd*nd,-1)))
+
+    n[0] = N                   # all samples are in the only component
+    lam = drawMVNormal(mean=muy,cov=covy)       # draw lambda from prior
+    r = drawWishart(nd,inv(nd*covy))            # draw r from prior
+    alpha = 1.0/drawGamma(0.5,2.0)              # draw alpha from prior
+    k = 1                                       # set only 1 component
+    S = Sample(mu,s,pi,lam,r,beta,w,alpha,k)    # define the sample
+    Samp.addsample(S)                           # add the sample
+    print '{}: initialised parameters'.format(time.asctime())
+
+    # loop over samples
+    z = 1
+    oldpcnt = 0
+    while z<Nsamples:
+
+        # define simulated annealing temperature
+        G = max(1.0,float(0.5*Nsamples)/float(z+1)) if anneal else 1.0
+
+        # sample missing data
+        for m in missidx:
+
+            # compute component probabilities
+            idx = np.argwhere(missmat[m,:]==0).reshape(-1)
+            nidx = np.argwhere(missmat[m,:]==1).reshape(-1)
+
+            # conditionally draw from that component
+            Y[m,nidx] = drawmissing(mu[c[m],:],s[c[m],:].reshape(nd,nd),nd,idx,nidx,Y[m,:])
+
+        # recompute muy and covy
+        muy = np.mean(Y,axis=0)
+        covy = np.cov(Y,rowvar=0)
+        inv_covy = inv(covy) if nd>1 else np.reshape(1.0/covy,(1,1))
+
+        # for each represented muj value
+        ybarj = [np.sum(Y[np.argwhere(c==j),:],0)/nj for j,nj in enumerate(n)]
+        mu = np.zeros((k,nd))
+        j = 0
+        for yb,nj,sj in zip(ybarj,n,s):
+            sj = np.reshape(sj,(nd,nd))
+            muj_cov = inv(nj*sj + r)
+            muj_mean = np.dot(muj_cov,nj*np.dot(sj,np.squeeze(yb)) + np.dot(r,lam))
+            mu[j,:] = drawMVNormal(mean=muj_mean,cov=muj_cov,size=1)
+            j += 1
+
+        # for lambda (depends on mu vector, k, and r)
+        lam_cov = inv(inv_covy + k*r)
+        lam_mean = np.dot(lam_cov,np.dot(inv_covy,muy) + np.dot(r,np.sum(mu,0)))
+        lam = drawMVNormal(mean=lam_mean,cov=lam_cov)
+
+        # for r (depnds on k, mu, and lambda)
+        temp = np.zeros((nd,nd))
+        for muj in mu:
+            temp += np.outer((muj-lam),np.transpose(muj-lam))
+        r = drawWishart(k+nd,inv(nd*covy + temp))
+
+        # from alpha (depends on k)
+        alpha = drawAlpha(k,N)
+
+        # for each represented sj value (depends on mu, c, beta, w)
+        for j,nj in enumerate(n):
+            temp = np.zeros((nd,nd))
+            temptemp = np.zeros((nd,nd))
+            idx = np.argwhere(c==j)
+            yj = np.reshape(Y[idx,:],(idx.shape[0],nd))
+            for yi in yj:
+                temp += np.outer((mu[j,:]-yi),np.transpose(mu[j,:]-yi))
+            temp_s = drawWishart(beta + nj,inv(beta*w + temp))
+            s[j,:] = np.reshape(temp_s,(1,nd*nd))
+
+        # compute the unrepresented probability - apply simulated annealing
+        # here
+        p_unrep = (alpha/(N-1.0+alpha))*IntegralApprox(Y,lam,r,beta,w,G,size=Nint)
+        p_temp = np.outer(np.ones(k+1),p_unrep)
+
+        # for the represented components
+        for j in xrange(k):
+            nij = n[j] - (c==j).astype(int)
+            idx = np.argwhere(nij>0)         # only apply to indices where we have multi occupancy
+            temp_s = G*np.reshape(s[j,:],(nd,nd))     # apply simulated annealing to this parameter
+            Q = np.array([np.dot(np.squeeze(Y[i,:]-mu[j,:]),np.dot(np.squeeze(Y[i,:]-mu[j,:]),temp_s)) for i in idx])
+            p_temp[j,idx] = nij[idx]/(N-1.0+alpha)*np.reshape(np.exp(-0.5*Q),idx.shape)*np.sqrt(det(temp_s))
+
+        # stochastic indicator (we could have a new component)
+        jvec = np.arange(k+1)
+        c = np.hstack(drawIndicator(jvec,p_temp))
+
+        # for w
+        w = drawWishart(k*beta + nd,inv(nd*inv_covy + beta*np.reshape(np.sum(s,0),(nd,nd))))
+
+        # from beta
+        beta = drawBeta(k,s,w)
+
+        # sort out based on new stochastic indicators
+        nij = np.sum(c==k)        # see if the *new* component has occupancy
+        if nij>0:
+            # draw from priors and increment k
+            newmu = drawMVNormal(mean=lam,cov=inv(r))
+            news = drawWishart(float(beta),inv(beta*w))
+            mu = np.concatenate((mu,np.reshape(newmu,(1,nd))))
+            s = np.concatenate((s,np.reshape(news,(1,nd*nd))))
+            k = k + 1
+
+        # find unrepresented components
+        n = np.array([np.sum(c==j) for j in xrange(k)])
+        badidx = np.argwhere(n==0)
+        Nbad = len(badidx)
+
+        # remove unrepresented components
+        if Nbad>0:
+            mu = np.delete(mu,badidx,axis=0)
+            s = np.delete(s,badidx,axis=0)
+            for cnt,i in enumerate(badidx):
+                idx = np.argwhere(c>=(i-cnt))
+                c[idx] = c[idx]-1
+            k -= Nbad        # update component number
+
+        # recompute n
+        n = np.array([np.sum(c==j) for j in xrange(k)])
+
+        # from pi
+        pi = n.astype(float)/np.sum(n)
+
+        pcnt = int(100.0*z/float(Nsamples))
+        if pcnt>oldpcnt:
+            print '{}: %--- {}% complete ----------------------%'.format(time.asctime(),pcnt)
+            if verb:
+                print '{}: ybarj = {}'.format(time.asctime(),np.reshape(ybarj,(1,-1)))
+                print '{}: mu = {}'.format(time.asctime(),np.reshape(mu,(1,-1)))
+                print '{}: lam = {}'.format(time.asctime(),np.reshape(lam,(1,-1)))
+                print '{}: r = {}'.format(time.asctime(),np.reshape(r,(1,-1)))
+                print '{}: alpha = {}'.format(time.asctime(),np.reshape(alpha,(1,-1)))
+                print '{}: s = {}'.format(time.asctime(),np.reshape(s,(1,-1)))
+                print '{}: w = {}'.format(time.asctime(),np.reshape(w,(1,-1)))
+                print '{}: beta = {}'.format(time.asctime(),np.reshape(beta,(1,-1)))
+                print '{}: k = {}'.format(time.asctime(),k)
+                print '{}: n = {}'.format(time.asctime(),np.reshape(n,(1,-1)))
+                print '{}: pi = {}'.format(time.asctime(),np.reshape(pi,(1,-1)))
+            oldpcnt = pcnt
+
+        # add sample
+        S = Sample(mu,s,pi,lam,r,beta,w,alpha,k)
+        newS = copy.deepcopy(S)
+        Samp.addsample(newS)
+        z += 1
+
+    # rescale the samples
+    Samp,Y = rescaleResults(Samp,Y,scale)
+
+    return Samp,Y
+
+def rescaleResults(Samp,Y,scale):
+    """Rescales the samples back to the original data scale
+    input:
+        Samp - the samples
+        scale - the menas and stdevs of the orginal data
+    output:
+        Samp - the rescaled samples
+    """
+    
+    # rescale the samples
+    nd = Samp.nd
+    N = Samp.N
+    temp = np.outer(scale[:,1],scale[:,1])
+    for i in xrange(N):
+
+        # rescale only the dimensionful parameters
+        # leave pi, beta, alpha, k untouched 
+        samples = Samp[i]
+        m = np.reshape(samples.mu,(samples.k,nd))
+        s = np.reshape(samples.s,(samples.k,nd,nd))
+        for j in xrange(samples.k):
+            m[j] = m[j]*scale[:,1] + scale[:,0]
+            s[j] /= temp
+        Samp[i].lam = Samp[i].lam*scale[:,1] + scale[:,0]
+        Samp[i].r /= temp
+        Samp[i].w /= temp    
+
+    # rescale data
+    for i in xrange(Y.shape[0]):
+        Y[i,:] = Y[i,:]*scale[:,1] + scale[:,0]
+
+    return Samp,Y
+
+def scaledata(Y,missmat=None):
+    """Scales the data to have unit variance and zero mean
+    inputs:
+        Y - input data
+        missmat - missing data matrix
+    outputs:
+        Y - rescaled data
+        scale - the scale parameters
+    """
+
+    # if no miss matrix set then make and empty one
+    if missmat is None:
+        missmat = np.zeros(Y.shape)
+
+    j = 0
+    _,nd = Y.shape
+    scale = np.zeros((nd,2))  # stores the means and variances of each dimension
+    for i,y in zip(missmat.transpose(),Y.transpose()):
+        z = y[np.argwhere(i==0)]
+        scale[j,0] = np.mean(z)
+        scale[j,1] = np.std(z)
+        Y[:,j] = (Y[:,j] - scale[j,0])/scale[j,1]
+        Y[np.argwhere(i==1),j] = 0
+        j += 1
+
+    return Y,scale
+
+def IntegralApprox(y,lam,r,beta,w,G=1,size=100):
     """estimates the integral in Eq.17 of Rasmussen (2000)"""
     temp = np.zeros(len(y))
     inv_betaw = inv(beta*w)
@@ -52,7 +344,7 @@ def IntegralApprox(y,lam,r,beta,w,size=100):
         mu = mv_norm.rvs(mean=lam,cov=inv_r,size=1)
         s = drawWishart(float(beta),inv_betaw)
         try:
-            temp += mv_norm.pdf(y,mean=np.squeeze(mu),cov=inv(s))
+            temp += mv_norm.pdf(y,mean=np.squeeze(mu),cov=G*inv(s))
         except:
             bad += 1
             pass
@@ -139,7 +431,7 @@ def drawAlpha(k,N,size=1):
     flag = True
     cnt = 0
     while flag:
-        xi = np.logspace(-2-cnt,3+cnt,50)       # update range if needed
+        xi = np.logspace(-2-cnt,3+cnt,200)       # update range if needed
         try:
             ars = ARS(logpalpha,logpalphaprime,xi=xi,lb=0, ub=np.inf, k=k, N=N)
             flag = False
@@ -166,7 +458,7 @@ def drawBeta(k,s,w,size=1):
     flag = True
     cnt = 0
     while flag:
-        xi = lb + np.logspace(-3-cnt,1+cnt,50)       # update range if needed
+        xi = lb + np.logspace(-3-cnt,1+cnt,200)       # update range if needed
         flag = False
         try:
             ars = ARS(logpbeta,logpbetaprime,xi=xi,lb=lb,ub=np.inf, \
@@ -191,168 +483,207 @@ def greedy(x):
     d[idx] = z
     return 1.0 - np.reshape(d,s)
 
-def plotresult(Samp,Y,nd,outfile,Ngrid,nstep):
-    """Plots the original data, with a averaged result in 
-       2D projections"""
+def computemargp(Samp,xvec,randidx,nel=1e6):
+    """computes the 2 and 1 marginalised posteriors
+    """ 
 
-    # extract data from samples
-    n = nd-1
-    plt.figure()
-    i,mu = extractchain(Samp,nd,'$\mu$')
-    _,prec = extractchain(Samp,nd,'$s$')
-    _,pi = extractchain(Samp,nd,'$\pi$')
-    if nd==1:
-        mu = np.expand_dims(np.array(mu), axis=1)
-        prec = np.expand_dims(np.array(prec), axis=1)
-    redmu = mu[mu.shape[0]/2::nstep,:]
-    redprec = prec[prec.shape[0]/2::nstep,:]
-    redpi = pi[pi.shape[0]/2::nstep]
-    label = []
-    for i in xrange(nd):
-        temp = '$x_{}$'.format(i)
-        label.append(temp)    
-
-    # make N-D grid
-    xvec = np.linspace(-10,10,Ngrid)
-    dx = xvec[1]-xvec[0]
-    grid = np.array(np.meshgrid(*[xvec for i in xrange(nd)],indexing='ij'))
-    grid = np.reshape(np.transpose(grid),(-1,nd),order='F')
+    nd = Samp.nd
+    Ngrid = xvec.shape[1]
+    if nd>1:
+        n = min(int(np.log10(float(nel))/np.log10(float(Ngrid))),nd)
+        nel = Ngrid**n
+        nchunk = (Ngrid**(nd-n))
+    else:
+        nel = Ngrid
+        nchunk = 1
     
-    # loop over each sample and compute the result in N-D grid
-    prob = np.zeros(Ngrid**nd)
-    for m,s,p in zip(redmu,redprec,redpi):
-        print m,s,p
-        prob += p*mv_norm.pdf(grid,mean=m,cov=np.reshape(s,(nd,nd)))
-    prob = np.reshape(prob,([Ngrid for q in xrange(nd)]),order='C')        
 
-    # make the 2D grid
-    xy = np.array(np.meshgrid(xvec,xvec))
-    xy = np.transpose(np.reshape(grid,(nd,-1)))
-
-    levels = [0.68, 0.95,0.999]
-    k = 0
-    for j in xrange(nd):
-        for i in xrange(nd):
-            if i>=j:
-                ij = np.unravel_index(k,[nd,nd])
-                plt.subplot(nd,nd,k+1)
-                ores = np.zeros(Ngrid)
-                nres = np.zeros((Ngrid,Ngrid))
-                sumidx = np.reshape(np.squeeze(np.argwhere((np.arange(nd)!=i)*(np.arange(nd)!=j))),(1,-1)).astype('int')
-                idx = tuple(map(tuple, sumidx))[0]
-                proj = np.squeeze(np.sum(prob,axis=idx,keepdims=True))
-                if proj.ndim==2:
-                    z = greedy(proj)
-                    plt.contour(xvec, xvec, z, levels, \
-                        colors='blue',linestyles=['solid','dashed','dotted'])
-                    plt.plot(Y[:,i],Y[:,j],'r.',alpha=0.5,markersize=3)
-                    plt.xlim([-10,10])
-                    plt.ylim([-10,10])
-                    plt.ylabel(label[j],fontsize=16)
-                    plt.xlabel(label[i],fontsize=16)
-                else:
-                    plt.hist(Y[:,i],25,histtype='stepfilled',normed=True,alpha=0.5,edgecolor='None',facecolor='red')
-                    z = proj/(np.sum(proj)*dx)
-                    plt.plot(xvec,z,'b')
-                    plt.yticks([])
-                    plt.xlabel(label[i],fontsize=16)
-                plt.subplots_adjust(hspace=.5) 
-                plt.subplots_adjust(wspace=.5)
-            k += 1
-    
-    plt.savefig(outfile)   
-             
-
-def project(x,idx):
-    """projects out dimension of matrix"""
-    n = x.shape[0]
-    y = np.zeros((n,n))
-    for k in np.reshape(idx,(-1,1)):
-        for i in xrange(n):
-            for j in xrange(n):
-                y[i,j] = x[i,j] - x[i,k]*x[k,j]/x[k,k]
+    # loop over manageable chunks of the grid and compute the result
+    res2 = np.zeros((nd,nd,Ngrid,Ngrid)) if nd>1 else np.zeros(Ngrid)
+    Np = np.array(Ngrid**np.arange(nd))
+    idx = np.zeros((nel,nd)).astype('int')
+    for cnt in xrange(nchunk):
         
-    return np.squeeze(np.delete(np.delete(y,idx,0),idx,1))        
+        # make grid locations for this chunk
+        temp = np.array(cnt*nel + np.arange(nel))
+        idx[:,0] = np.array(temp/Np[-1]).astype('int')
+        for i in xrange(1,nd):
+            temp = temp - idx[:,i-1]*Np[nd-i]
+            idx[:,i] = np.array(temp/Np[nd-i-1]).astype('int')
+        grid = np.array([xvec[i,idx[:,i]] for i in xrange(nd)]).transpose()
 
-def plotellipses(Samp,Y,nd,outfile,Ngrid,Nellipse):
-    """Plots samples of ellipses drawn frok the posterior"""
+        # loop over the samples
+        prob = np.zeros(nel)
+        for k in randidx:
+            samples = Samp[k]
+            s = np.reshape(samples.s,(samples.k,nd*nd))
+            m = np.reshape(samples.mu,(samples.k,nd))
+            p = np.reshape(np.array(np.squeeze(samples.pi)),(-1,1))
+            
+            # loop over the components
+            for b in xrange(samples.k):
+                prob += p[b]*mv_norm.pdf(grid,mean=m[b,:],cov=inv(np.reshape(s[b,:],(nd,nd))))
+
+        # for each 2D pair of dimensions
+        if nd>1:
+            for i in xrange(nd):
+                for j in xrange(nd):
+                    for k,gc in enumerate(idx):
+                        res2[i,j,gc[j],gc[i]] += prob[k]
+        else:
+            res2 += prob
+
+    # make 1D results
+    temp = np.arange(1,nd)
+    res1 = np.zeros((nd,Ngrid))
+    if nd>1:
+        for i in xrange(nd):
+            res1[i,:] = np.squeeze(np.sum(res2[0,i,:,:],axis=1))
+    else:
+        res1 = np.reshape(res2,(1,-1))
+
+    return res2,res1
+
+
+def plotresult(Samp,Y,outfile,missmat=None,Ngrid=100,M=4,plottype='ellipse'):
+    """Plots samples of ellipses drawn from the posterior"""
     
+    nd = Samp.nd
     N = Samp.N
-    xvec = np.linspace(-10,10,Ngrid)
-    label = []
+    lower = np.min(Y,axis=0)
+    upper = np.max(Y,axis=0)
+    lower = lower - 0.5*(upper-lower)
+    upper = upper + 0.5*(upper-lower)
+    xvec = np.zeros((nd,Ngrid))
     for i in xrange(nd):
-        temp = '$x_{}$'.format(i)
-        label.append(temp)
-    fig = plt.figure()
-    f, ax = plt.subplots(nd,nd)
-    randidx = np.random.randint(N/2,N,Nellipse)
+        xvec[i,:] = np.linspace(lower[i],upper[i],Ngrid)
+    label = ['$x_{}$'.format(i) for i in xrange(nd)]
+    levels = [0.68, 0.95,0.999]
+    alpha = [1.0, 0.5, 0.2]
+
+    plt.figure(figsize = (nd,nd))
+    gs1 = gridspec.GridSpec(nd, nd)
+    gs1.update(left=0.15, right=0.85, top=0.85, bottom=0.15, wspace=0, hspace=0)
+
+    # fill in miss matrix if not set
+    if missmat is None:
+        missmat = np.zeros(Y.shape)
+
+    # pick random samples to use
+    randidx = np.random.randint(N/2,N,M)
+
+    # compute 2 and 1D marginalised probabilities
+    if plottype=='map':
+        res2,res1 = computemargp(Samp,xvec,randidx)
+    
     cnt = 0
     for i in xrange(nd):
         for j in xrange(nd):
             
-            # plot the data
+            ij = np.unravel_index(cnt,[nd,nd])
+            ax1 = plt.subplot(gs1[ij])
+            ax1.set_xticklabels([])
+            ax1.set_yticklabels([])    
+
+            # scatter plot the data in lower triangle plots
             if i>j:
-                ax[j,i].plot(Y[:,i],Y[:,j],'r.',alpha=0.5,markersize=1)
-            elif i==j:
-                print Y.shape
+                ax1.plot(Y[:,j],Y[:,i],'r.',alpha=0.5,markersize=0.5)
+                ax1.set_xlim([lower[j],upper[j]])
+                ax1.set_ylim([lower[i],upper[i]])
+            elif i==j:  # otherwise on the diagonal plot histograms
                 if nd>1:
-                    ax[j,i].hist(Y[:,i],25,histtype='stepfilled',normed=True,alpha=0.5,edgecolor='None',facecolor='red')            
+                    newY = Y[np.argwhere(missmat[:,i]==0),i]
+                    ax1.hist(newY,25,histtype='stepfilled',normed=True,alpha=0.5,edgecolor='None',facecolor='red')            
+                    ax1.set_xlim([lower[j],upper[j]])
                 else:
-                    plt.hist(Y[:,i],25,histtype='stepfilled',normed=True,alpha=0.5,edgecolor='None',facecolor='red')
+                    newY = Y[np.argwhere(missmat[:,i]==0),i]
+                    plt.hist(newY,25,histtype='stepfilled',normed=True,alpha=0.5,edgecolor='None',facecolor='red')
+                    plt.xlim([lower[j],upper[j]])
+                    plt.ylim([lower[i],upper[i]])
 
+            if plottype=='ellipse':
+                
+                # if off the diagonal
+                if i>=j:
 
-            # if off the diagonal
-            if i>=j:
-                ij = np.unravel_index(cnt,[nd,nd])
-
-                # select 
-                for k in randidx:
-                    samples = Samp[k]
-                    s = np.reshape(samples.s,(samples.k,nd*nd))
-                    m = np.reshape(samples.mu,(samples.k,nd))
-                    p = np.reshape(np.array(np.squeeze(samples.pi)),(-1,1))
+                    # loop over randomly selected samples
+                    for k in randidx:
+                        samples = Samp[k]
+                        s = np.reshape(samples.s,(samples.k,nd*nd))
+                        m = np.reshape(samples.mu,(samples.k,nd))
+                        p = np.reshape(np.array(np.squeeze(samples.pi)),(-1,1))
                     
-                    for b in xrange(samples.k):
-                        tempC = np.reshape(s[b,:],(nd,nd))
-                        idx = np.reshape(np.squeeze(np.argwhere((np.arange(nd)!=i)*(np.arange(nd)!=j))),(1,-1)).astype('int')
-                        ps = tempC if np.any(np.array(idx.shape)==0) else project(tempC,idx)
-                        if ps.size==4:
-                            w,v = eig(inv(ps))
-                            e = Ellipse(xy=m[b,[i,j]], width=2.0*np.sqrt(6.0*w[1]), \
-                                height=2*np.sqrt(6.0*w[0]), \
-                                angle=(180.0/np.pi)*np.arctan2(v[0,1],v[0,0]), \
-                                alpha=np.squeeze(p[b]))
-                            e.set_facecolor('none')
-                            e.set_edgecolor('b')
-                            ax[j,i].add_artist(e)
-                            ax[j,i].set_xlim([-10,10])
-                            ax[j,i].set_ylim([-10,10])
-                            ax[j,i].set_ylabel(label[j],fontsize=16)
-                            ax[j,i].set_xlabel(label[i],fontsize=16)    
-                        elif ps.size==1:
-                            if nd>1:
-                                ax[j,i].plot(xvec,p[b]*norm.pdf(xvec,loc=m[b,i],scale=1.0/np.sqrt(np.squeeze(ps))),'b',alpha=p[b]) 
-                                ax[j,i].set_yticks([])
-                                ax[j,i].set_xlabel(label[i],fontsize=16)
+                        # loop over components in this sample
+                        for b in xrange(samples.k):
+                            tempC = inv(np.reshape(s[b,:],(nd,nd)))
+                            ps = tempC[np.ix_([i,j],[i,j])] if i!=j else tempC[i,i]                        
+
+                            # if we have a 2D covariance after projecting
+                            if ps.size==4:
+                                w,v = eig(ps)
+                                e = Ellipse(xy=m[b,[j,i]],width=2.0*np.sqrt(6.0*w[1]), \
+                                    height=2*np.sqrt(6.0*w[0]), \
+                                    angle=(180.0/np.pi)*np.arctan2(v[0,1],v[0,0]), \
+                                    alpha=np.squeeze(p[b]))
+                                e.set_facecolor('none')
+                                e.set_edgecolor('b')
+                                ax1.add_artist(e)
+                            elif ps.size==1:
+                                if nd>1:
+                                    ax1.plot(xvec[i,:],p[b]*norm.pdf(xvec[i,:],loc=m[b,i],scale=np.sqrt(np.squeeze(ps))),'b',alpha=p[b]) 
+                                else:
+                                    plt.plot(xvec[i,:],p[b]*norm.pdf(xvec[i,:],loc=m[b,i],scale=np.sqrt(np.squeeze(ps))),'b',alpha=p[b])
                             else:
-                                plt.plot(xvec,p[b]*norm.pdf(xvec,loc=m[b,i],scale=1.0/np.sqrt(np.squeeze(ps))),'b',alpha=p[b])
-                                plt.yticks([])
-                                plt.xlabel(label[i],fontsize=16)
-                        else:
-                            print '{}: ERROR strange number of elements in projected matrix'.format(time.asctime())
-                            exit(0)
+                                print '{}: ERROR strange number of elements in projected matrix'.format(time.asctime())
+                                exit(0)
+                
+            elif plottype=='map':
+
+                if i>j:
+
+                    proj = np.squeeze(res2[i,j,:,:])
+                    z = greedy(proj)
+                    xtemp = xvec[j,:].flatten()
+                    ytemp = xvec[i,:].flatten()
+                    for lev,a in zip(levels,alpha):
+                        plt.contour(xvec[j,:].flatten(), xvec[i,:].flatten(), np.transpose(z), [lev], \
+                            colors='blue',linestyles=['solid'], alpha=a, \
+                            linewidth=0.5)
+                    newY = Y[np.squeeze(np.argwhere(np.all(missmat==0,1))),:]
+                    xY = Y[np.argwhere(missmat[:,i]==1),j]
+                    yY = Y[np.argwhere(missmat[:,j]==1),i]
+                    ax1.plot(Y[np.argwhere(missmat[:,j]==1),j],Y[np.argwhere(missmat[:,j]==1),i],'k+',alpha=1,markersize=3)
+                    ax1.plot(Y[np.argwhere(missmat[:,i]==1),j],Y[np.argwhere(missmat[:,i]==1),i],'ko',alpha=1,markersize=1)
+                    ax1.plot(newY[:,j],newY[:,i],'r.',alpha=0.5,markersize=0.5)
+                    ax1.plot(np.ones(len(yY))*upper[j],yY,'g+')
+                    ax1.plot(xY,np.ones(len(xY))*upper[i],'g+')
+
+                elif i==j:  # for diagonal elements plot 1D marginalised posteriors
+                    proj = np.squeeze(res1[i,:])
+                    z = proj/(np.sum(proj)*(xvec[i,1]-xvec[i,0]))
+                    ax1.plot(xvec[i],z,'b')
 
             else:
-                ax[j,i].axis('off') if nd>1 else plt.axis('off')
+                print '{} : ERROR unknown plottype {}. Exiting.'.format(time.asctime(),plottype)
+                exit(1)
+
+            if j>i:
+                ax1.axis('off') if nd>1 else plt.axis('off')
+            if cnt>=nd*(nd-1):
+                plt.xlabel(label[j],fontsize=12)
+                ax1.xaxis.labelpad = -5
+            if (cnt % nd == 0) and cnt>0:
+                plt.ylabel(label[i],fontsize=12)
+                ax1.yaxis.labelpad = -3
             cnt += 1
 
-    f.subplots_adjust(hspace=.5)
-    f.subplots_adjust(wspace=.5)        
-    plt.savefig(outfile)
+    plt.savefig(outfile,dpi=300)
 
-def extractchain(Samp,nd,label):
+def extractchain(Samp,label):
     """Extract the chains of the mean, precision, pi etc, variables"""
+    
     i = 0
+    nd = Samp.nd
     xdata = []
     ydata = []
     # choose the quantity and plot it
@@ -363,12 +694,12 @@ def extractchain(Samp,nd,label):
                 xdata.append(i*np.ones(nd))
                 ydata.append(np.squeeze(m[d,:]))
             i += 1
-    elif label=='$s$':
+    elif label=='$[s]^{-1}$':
         for sample in Samp:
-            s = np.reshape(sample.s,(sample.k,nd*nd))
+            s = np.reshape(sample.s,(sample.k,nd,nd))
             for d in xrange(sample.k):
                 xdata.append(i*np.ones(nd*nd))
-                ydata.append(np.squeeze(np.reshape(inv(np.reshape(s[d,:],(nd,nd))),(1,nd*nd))))
+                ydata.append(np.squeeze(np.reshape(inv(s[d,:,:]),(1,nd*nd))))
             i += 1
     elif label=='$\\pi$':
         for sample in Samp:
@@ -392,6 +723,11 @@ def extractchain(Samp,nd,label):
             xdata.append(i)
             ydata.append(np.log(np.squeeze(sample.beta)))
             i += 1
+    elif label=='$\\beta$':
+        for sample in Samp:
+            xdata.append(i)
+            ydata.append(np.squeeze(sample.beta))
+            i += 1
     elif label=='$w$':
         for sample in Samp:
             xdata.append(i*np.ones(nd*nd))
@@ -413,23 +749,28 @@ def extractchain(Samp,nd,label):
     
     return np.array(xdata),np.array(ydata)
 
-def plotsamples(Samp,nd,args,chainfile,histfile):
+def plotsamples(Samp,args,chainfile,histfile):
     """Generates plots of samples as a function of index
        and also plots histograms of samples"""
 
+    nd = Samp.nd
     f1, ax1 = plt.subplots(3,3)
     f2, ax2 = plt.subplots(3,3)
 
-    truths = [args.mu,np.reshape(args.cov,(1,-1)),np.reshape(args.pi,(1,-1)), \
-        None,None,None,None,None,len(args.pi)]
-    label = [r'$\mu$',r'$s$',r'$\pi$', \
+    if args.inputfile:
+        truths = [None] * 9
+    else:
+        truths = [args.mu,args.cov,args.pi, \
+            None,None,None,None,None,len(args.pi)]
+
+    label = [r'$\mu$',r'$[s]^{-1}$',r'$\pi$', \
         r'$\lambda$',r'$r$',r'$\log\beta$', \
         r'$w$',r'$\alpha$',r'$k$']
     idx = 0
     for l,t in zip(label,truths):
         
         ij = np.unravel_index(idx,[3,3])
-        xx,yy = extractchain(Samp,nd,l)
+        xx,yy = extractchain(Samp,l)
 
         # plot the chains
         x = np.squeeze(np.reshape(xx,(1,-1)))
@@ -440,17 +781,17 @@ def plotsamples(Samp,nd,args,chainfile,histfile):
         ax1[ij].set_xlabel(r'$i$',fontsize=10)
         ax1[ij].set_ylabel(l,fontsize=12)
         
-        dum = t if np.any(t) else y
-        rng = np.max(dum)-np.min(dum)
-        lower = np.min(dum) - 0.5*rng
-        upper = np.max(dum) + 0.5*rng
+        # define lower and upper ranges to plot (use the data)
+        lower = np.min(y[len(y)/2:])
+        upper = np.max(y[len(y)/2:])
         if l=='$\pi$':
             lower = 0
             upper = 1
         if l=='$k$' or l=='$\\alpha$':
             lower = 0
-        if l=='$k$':
-            upper = np.max(y) + 1
+        if l=='$[s]^{-1}$':
+            lower = np.percentile(y,5)
+            upper = np.percentile(y,95)
 
         ax1[ij].set_ylim([lower, upper])
         ax1[ij].set_xlim([x[0],x[-1]+1])
@@ -464,7 +805,7 @@ def plotsamples(Samp,nd,args,chainfile,histfile):
             if l=='$k$':
                 ax2[ij].hist(newy[n/2:],np.arange(0,np.max(newy[n/2:])+1)+0.5, \
                     normed=True,histtype='stepfilled',alpha=0.5,edgecolor='None')    
-            elif l=='$s$':
+            elif l=='$[s]^{-1}$':
                 ax2[ij].hist(newy[n/2:], \
                     np.linspace(np.percentile(newy,5),np.percentile(newy,95),25), \
                     normed=True,histtype='stepfilled', \
@@ -474,13 +815,13 @@ def plotsamples(Samp,nd,args,chainfile,histfile):
                 alpha=0.5,edgecolor='None')
         ax2[ij].axes.get_yaxis().set_ticks([])
         ax2[ij].set_xlabel(l,fontsize=12)
-        upper = ax2[ij].get_ylim()[1]
+        hupper = ax2[ij].get_ylim()[1]
         for s in np.reshape(t,(1,-1)):
-            ax2[ij].plot((s,s), (0, upper), 'r-',alpha=0.5)
-        lower = 0
+            ax2[ij].plot((s,s), (0, hupper), 'r-',alpha=0.5)
+        hlower = 0
         if l=='$k$':
-            ax2[ij].set_xlim([0, np.max(yy)+1])
-        ax2[ij].set_ylim([lower, upper])
+            ax2[ij].set_xlim([0, np.max(newy[n/2:])+1])
+        ax2[ij].set_ylim([hlower, hupper])
         ax2[ij].tick_params(axis='both', which='major', labelsize=10)    
 
         idx += 1
@@ -491,214 +832,19 @@ def plotsamples(Samp,nd,args,chainfile,histfile):
     f1.savefig(chainfile)
     f2.savefig(histfile)
 
-# command line parser
-def parser():
-    """Parses command line arguments"""
-    parser = argparse.ArgumentParser(prog='igmm.py',description='Applies an N-Dimensional infinite Gaussian mixture model to data')
-    parser.add_argument('-d', '--Ndim', type=int, default=2, help='the dimension of the data')
-    parser.add_argument('-c', '--cov', type=float, nargs='+', default=[3.0,1.0,1.0,5.0,5.0,0.0,0.0,2.0,2.0,-1.5,-1.5,2.0], help='the precision of each Gaussian component')
-    parser.add_argument('-m', '--mu', type=float, nargs='+', default=[-3,1,0,7,5,-5], help='the means of the simulated Gaussians')
-    parser.add_argument('-p', '--pi', type=float, nargs='+', default=[0.4,0.4,0.2], help='the simulated Gaussian weights')
-    parser.add_argument('-N', '--Ndata', type=int, default=100, help='the number of input data samples to use')
-    parser.add_argument('-n', '--Nsamples', type=int, default=1000, help='the number of samples to produce')
-    parser.add_argument('-a', '--Nint', type=int, default=10, help='the number of samples used in approximating the tricky integral')
-    parser.add_argument('-z', '--seed', type=int, default=1, help='the random seed')
-    parser.add_argument('-v', '--verb', action='count', default=0)
-    return parser.parse_args()
+def drawmissing(mu,s,nd,idx,nidx,x):
 
-# the main part of the code
-def main():
-    """Takes command line args and computes samples from the joint posterior
-    using Gibbs sampling"""
-
-    # record the start time
-    t = time.time()
-
-    # get the command line args
-    args = parser()
-    if args.seed>0:
-        np.random.seed(args.seed)
-    N = args.Ndata
-    nd = args.Ndim
-    args.mu = np.reshape(args.mu,(-1,nd))
-    args.cov = np.reshape(args.cov,(-1,nd,nd))
-
-    # generate some data to start with
-    args.pi = args.pi/np.sum(args.pi)
-    M = np.transpose(np.random.multinomial(N, args.pi, size=1))
-    Y = []
-    for i,m in enumerate(M):
-        temp = mv_norm.rvs(mean=args.mu[i],cov=args.cov[i],size=m)
-        if nd==1:
-            temp = np.expand_dims(temp,axis=1)
-        Y.append(temp)
-    Y = np.vstack(Y)
-
-    # compute some data derived quantities
-    muy = np.mean(Y,0)
-    print muy.shape
-    covy = np.reshape(np.cov(Y,rowvar=0),(nd,nd))
-    inv_covy = inv(covy) if nd>1 else np.reshape(1.0/covy,(1,1))
-    if args.verb:
-        print '{}: true mean(Y) = {}'.format(time.asctime(),np.reshape(args.mu,(1,-1)))
-        print '{}: true cov(Y) = {}'.format(time.asctime(),np.reshape(args.cov,(1,-1)))
-        print '{}: mean(Y) = {}'.format(time.asctime(),np.reshape(muy,(1,-1)))
-        print '{}: cov(Y) = {}'.format(time.asctime(),np.reshape(covy,(1,-1)))
-
-    # initialise a single sample
-    Samp = Samples(args.Nsamples)
-    c = np.zeros(N)                             # initialise the stochastic indicators
-    pi = np.zeros(1)                            # initialise the weights
-    mu = np.zeros((1,nd))                       # initialise the means
-    s = np.zeros((1,nd*nd))                     # initialise the precisions
-    n = np.zeros(1)                             # initialise the occupation numbers
-    
-    mu[0,:] = muy                               # set first mu to the mean of all data    
-    pi[0] = 1.0                                 # only one component so pi=1
-    temp = drawGamma(0.5,2.0/float(nd))
-    beta = np.squeeze(float(nd) - 1.0 + 1.0/temp)     # draw beta from prior
-    print covy.shape
-    w = drawWishart(nd,covy/float(nd))                # draw w from prior
-    s[0,:] = np.squeeze(np.reshape(drawWishart(float(beta),inv(beta*w)),(nd*nd,-1))) # draw s from prior
-
-    n[0] = N                                    # all samples are in the only component
-    lam = drawMVNormal(mean=muy,cov=covy)       # draw lambda from prior
-    r = drawWishart(nd,inv(nd*covy))            # draw r from prior
-    alpha = 1.0/drawGamma(0.5,2.0)              # draw alpha from prior
-    k = 1                                       # set only 1 component
-    S = Sample(mu,s,pi,lam,r,beta,w,alpha,k)    # define the sample
-    Samp.addsample(S)                           # add the sample
-    print '{}: initialised parameters'.format(time.asctime())
-
-    # loop over samples
-    z = 1
-    oldpcnt = 0
-    while z<args.Nsamples:
-
-        # for each represented muj value
-        ybarj = [np.sum(Y[np.argwhere(c==j),:],0)/nj for j,nj in enumerate(n)]
-        mu = np.zeros((k,nd))
-        j = 0
-        for yb,nj,sj in zip(ybarj,n,s):
-            sj = np.reshape(sj,(nd,nd))
-            muj_cov = inv(nj*sj + r)
-            muj_mean = np.dot(muj_cov,nj*np.dot(sj,np.squeeze(yb)) + np.dot(r,lam))
-            mu[j,:] = drawMVNormal(mean=muj_mean,cov=muj_cov,size=1)
-            j += 1
-
-        # for lambda (depends on mu vector, k, and r)
-        lam_cov = inv(inv_covy + k*r)
-        lam_mean = np.dot(lam_cov,np.dot(inv_covy,muy) + np.dot(r,np.sum(mu,0)))
-        lam = drawMVNormal(mean=lam_mean,cov=lam_cov)
-
-        # for r (depnds on k, mu, and lambda)
-        temp = np.zeros((nd,nd))
-        for muj in mu:
-            temp += np.outer((muj-lam),np.transpose(muj-lam))
-        r = drawWishart(k+nd,inv(nd*covy + temp))
-
-        # from alpha (depends on k)
-        alpha = drawAlpha(k,N)
-
-        # for each represented sj value (depends on mu, c, beta, w)
-        for j,nj in enumerate(n):
-            temp = np.zeros((nd,nd))
-            temptemp = np.zeros((nd,nd))
-            idx = np.argwhere(c==j)
-            yj = np.reshape(Y[idx,:],(idx.shape[0],nd))
-            for yi in yj:
-                temp += np.outer((mu[j,:]-yi),np.transpose(mu[j,:]-yi))
-            temp_s = drawWishart(beta + nj,inv(beta*w + temp))
-            s[j,:] = np.reshape(temp_s,(1,nd*nd))
-
-        # compute the unrepresented probability
-        p_unrep = (alpha/(N-1.0+alpha))*IntegralApprox(Y,lam,r,beta,w,size=args.Nint)
-        p_temp = np.outer(np.ones(k+1),p_unrep)
-
-        # for the represented components
-        for j in xrange(k):
-            nij = n[j] - (c==j).astype(int)
-            idx = np.argwhere(nij>0)         # only apply to indices where we have multi occupancy
-            temp_s = np.reshape(s[j,:],(nd,nd))
-            p_temp[j,idx] = nij[idx]/(N-1.0+alpha)*((2.0*np.pi)**(0.5*nd))*np.reshape(mv_norm.pdf(Y[idx,:],mean=mu[j,:],cov=inv(temp_s)),idx.shape)
-
-        # stochastic indicator (we could have a new component)
-        jvec = np.arange(k+1)
-        c = np.hstack(drawIndicator(jvec,p_temp))
-
-        # for w
-        w = drawWishart(k*beta + nd,inv(nd*inv_covy + beta*np.reshape(np.sum(s,0),(nd,nd))))
-        
-        # from beta
-        beta = drawBeta(k,s,w)
-
-        # sort out based on new stochastic indicators
-        nij = np.sum(c==k)        # see if the *new* component has occupancy
-        if nij>0:
-            # draw from priors and increment k
-            newmu = drawMVNormal(mean=lam,cov=inv(r))
-            news = drawWishart(float(beta),inv(beta*w))
-            mu = np.concatenate((mu,np.reshape(newmu,(1,nd))))
-            s = np.concatenate((s,np.reshape(news,(1,nd*nd)))) 
-            k = k + 1
-
-        # find unrepresented components
-        n = np.array([np.sum(c==j) for j in xrange(k)])
-        badidx = np.argwhere(n==0)
-        Nbad = len(badidx)
-
-        # remove unrepresented components
-        if Nbad>0:
-            mu = np.delete(mu,badidx,axis=0)
-            s = np.delete(s,badidx,axis=0)
-            for cnt,i in enumerate(badidx):
-                idx = np.argwhere(c>=(i-cnt))
-                c[idx] = c[idx]-1
-            k -= Nbad        # update component number
-
-        # recompute n
-        n = np.array([np.sum(c==j) for j in xrange(k)])
-
-        # from pi
-        pi = n.astype(float)/np.sum(n)
-
-        pcnt = int(100.0*z/float(args.Nsamples))
-        if pcnt>oldpcnt:
-            print '{}: %--- {}% complete ----------------------%'.format(time.asctime(),pcnt)
-            if args.verb:
-                print '{}: ybarj = {}'.format(time.asctime(),np.reshape(ybarj,(1,-1)))   
-                print '{}: mu = {}'.format(time.asctime(),np.reshape(mu,(1,-1)))
-                print '{}: lam = {}'.format(time.asctime(),np.reshape(lam,(1,-1)))
-                print '{}: r = {}'.format(time.asctime(),np.reshape(r,(1,-1)))
-                print '{}: alpha = {}'.format(time.asctime(),np.reshape(alpha,(1,-1)))       
-                print '{}: s = {}'.format(time.asctime(),np.reshape(s,(1,-1)))
-                print '{}: w = {}'.format(time.asctime(),np.reshape(w,(1,-1)))
-                print '{}: beta = {}'.format(time.asctime(),np.reshape(beta,(1,-1)))            
-                print '{}: k = {}'.format(time.asctime(),k)
-                print '{}: n = {}'.format(time.asctime(),np.reshape(n,(1,-1)))
-                print '{}: pi = {}'.format(time.asctime(),np.reshape(pi,(1,-1)))
-            oldpcnt = pcnt        
-
-        # add sample
-        S = Sample(mu,s,pi,lam,r,beta,w,alpha,k)
-        newS = copy.deepcopy(S)
-        Samp.addsample(newS)
-        z += 1
-
-    # print computation time
-    print "{}: time to complete main analysis = {} sec".format(time.asctime(),time.time()-t)    
-
-    # plot chains, histograms, average maps, and overlayed ellipses
-    print '{}: making output plots'.format(time.asctime()) 
-    Ngrid = min(100,int(1e6**(1.0/nd)))
-    plotsamples(Samp,nd,args,'./chains.png','./hist.png')
-    plotresult(Samp,Y,nd,'./maps.png',Ngrid,10)
-    plotellipses(Samp,Y,nd,'./ellipses.png',Ngrid,10)
-
-    print '{}: success'.format(time.asctime())    
-
-if __name__ == "__main__":
-    exit(main())
+    j = idx.shape[0]
+    k = nd - j
+    y = np.array(x[idx] - mu[idx])        # the known distance form the mean
+    A = s[np.ix_(nidx,nidx)].reshape(k,k)       # the precision matrix on the missing data
+    B = np.reshape(s,(nd,nd))[np.ix_(idx,nidx)].reshape(j,k)        # the precision matrix off-diagonal terms
+    newmu = np.squeeze(mu[nidx] - np.transpose(np.dot(solve(A,np.transpose(B)),y.reshape(j,1))))
+    newcov = inv(A)
+    return drawMVNormal(mean=newmu,cov=newcov,size=1) 
 
 
-#gibbs()
+
+
+
+
